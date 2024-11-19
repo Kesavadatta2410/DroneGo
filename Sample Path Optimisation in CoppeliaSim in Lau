@@ -1,0 +1,182 @@
+sim=require'sim'
+
+function sysCall_init() 
+    -- Particle and shadow parameters
+    particlesAreVisible=true
+    simulateParticles=true
+    fakeShadow=true
+    
+    particleCountPerSecond=430
+    particleSize=0.005
+    particleDensity=8500
+    particleScatteringAngle=30
+    particleLifeTime=0.5
+    maxParticleCount=50
+
+    targetObj=sim.getObject('../target')
+    sim.setObjectParent(targetObj, -1, true)
+
+    -- Get the drone's main body handle (assumed as 'base')
+    d=sim.getObject('../base')
+
+    propellerHandles={}
+    jointHandles={}
+    particleObjects={-1,-1,-1,-1}
+    local ttype=sim.particle_roughspheres + sim.particle_cyclic + sim.particle_respondable1to4 + sim.particle_respondable5to8 + sim.particle_ignoresgravity
+    if not particlesAreVisible then
+        ttype = ttype + sim.particle_invisible
+    end
+    for i=1,4,1 do
+        propellerHandles[i] = sim.getObject('../propeller['..(i-1)..']/respondable')
+        jointHandles[i] = sim.getObject('../propeller['..(i-1)..']/joint')
+        if simulateParticles then
+            particleObjects[i] = sim.addParticleObject(ttype, particleSize, particleDensity, {2, 1, 0.2, 3, 0.4}, particleLifeTime, maxParticleCount, {0.3, 0.7, 1})
+        end
+    end
+    heli = sim.getObject('..')
+
+    -- PID control parameters
+    pParam, iParam, dParam, vParam = 2, 0.1, 0.2, -2
+    cumul, lastE = 0, 0
+
+    -- Drone movement parameters
+    droneHandle = sim.getObjectHandle('/Quadcopter')  
+    targetHandle = sim.getObjectHandle('/Target_3')     
+    speed = 0.005
+
+    -- Fixed height to maintain
+    fixedHeight = 1.5  -- Increased height to ensure it doesn't land on the ground
+
+    -- Add shadow for realism
+    if fakeShadow then
+        shadowCont = sim.addDrawingObject(sim.drawing_discpts + sim.drawing_cyclic + sim.drawing_25percenttransparency + sim.drawing_50percenttransparency + sim.drawing_itemsizes, 0.2, 0, -1, 1)
+    end
+end
+
+function sysCall_cleanup() 
+    sim.removeDrawingObject(shadowCont)
+    for i=1,#particleObjects,1 do
+        sim.removeParticleObject(particleObjects[i])
+    end
+end 
+
+function sysCall_actuation()
+    -- Shadow rendering for the drone
+    pos = sim.getObjectPosition(d)
+    if fakeShadow then
+        itemData = {pos[1], pos[2], 0.002, 0, 0, 0, 1, 0.2}
+        sim.addDrawingObjectItem(shadowCont, itemData)
+    end
+
+    -- Vertical lift control with PID to maintain fixed height
+    pos = sim.getObjectPosition(droneHandle)  -- Updated to get the current position of the drone
+    l = sim.getVelocity(heli)
+    e = (fixedHeight - pos[3])  -- Error in height
+    cumul = cumul + e
+    pv = pParam * e
+    thrust = 9.81 + pv + iParam * cumul + dParam * (e - lastE) + l[3] * vParam
+    lastE = e
+
+    -- Set thrust to maintain height
+    setThrust(thrust)
+
+    -- Movement toward the target with obstacle check
+    local targetPosition = sim.getObjectPosition(targetHandle, -1)
+    local dronePosition = sim.getObjectPosition(droneHandle, -1)
+
+    if detectObstacle() then
+        -- Avoidance maneuver if obstacle detected
+        executeAvoidanceManeuver(dronePosition)
+    else
+        -- Move directly toward the target if no obstacle detected
+        moveToTarget(dronePosition, targetPosition)
+    end
+
+    -- Maintain fixed orientation (no rotation)
+    local fixedOrientation = {0, 0, 0}  -- No rotation (roll, pitch, yaw)
+    sim.setObjectOrientation(droneHandle, -1, fixedOrientation)
+end
+
+function setThrust(thrust)
+    -- Set motor velocities for each propeller
+    for i = 1, 4 do
+        handlePropeller(i, thrust)
+    end
+end
+
+function handlePropeller(index, particleVelocity)
+    local propellerRespondable = propellerHandles[index]
+    local propellerJoint = jointHandles[index]
+    local propeller = sim.getObjectParent(propellerRespondable)
+    local particleObject = particleObjects[index]
+    local maxParticleDeviation = math.tan(particleScatteringAngle * 0.5 * math.pi / 180) * particleVelocity
+    local notFullParticles = 0
+    local t = sim.getSimulationTime()
+    sim.setJointPosition(propellerJoint, t * 10)
+    local ts = sim.getSimulationTimeStep()
+    local m = sim.getObjectMatrix(propeller)
+    local particleCnt = 0
+    local pos = {0, 0, 0}
+    local dir = {0, 0, 1}
+    local requiredParticleCnt = particleCountPerSecond * ts + notFullParticles
+    notFullParticles = requiredParticleCnt % 1
+    requiredParticleCnt = math.floor(requiredParticleCnt)
+    while particleCnt < requiredParticleCnt do
+        local x = (math.random() - 0.5) * 2
+        local y = (math.random() - 0.5) * 2
+        if x * x + y * y <= 1 then
+            if simulateParticles then
+                pos[1] = x * 0.08
+                pos[2] = y * 0.08
+                pos[3] = -particleSize * 0.6
+                dir[1] = pos[1] + (math.random() - 0.5) * maxParticleDeviation * 2
+                dir[2] = pos[2] + (math.random() - 0.5) * maxParticleDeviation * 2
+                dir[3] = pos[3] - particleVelocity * (1 + 0.3 * math.random())
+                sim.addParticleObjectItem(particleObject, {pos[1], pos[2], pos[3], dir[1], dir[2], dir[3]})
+            end
+            particleCnt = particleCnt + 1
+        end
+    end
+end
+
+function detectObstacle()
+    local frontSensorHandle = sim.getObjectHandle('/Quadcopter/Proximity_sensor_front')
+    local backSensorHandle = sim.getObjectHandle('/Quadcopter/Proximity_sensor_back')
+
+    -- Read sensor values
+    local frontDetected = sim.readProximitySensor(frontSensorHandle) or 0
+    local backDetected = sim.readProximitySensor(backSensorHandle) or 0
+
+    -- Return true if any sensor detects an obstacle
+    return frontDetected > 0 or backDetected > 0
+end
+
+function executeAvoidanceManeuver(dronePosition)
+    -- Back away from the detected obstacle
+    local backDistance = 0.02  -- Distance to back away
+    local newPosition = {
+        dronePosition[1],
+        dronePosition[2] + backDistance,  -- Move backward
+        fixedHeight
+    }
+    sim.setObjectPosition(droneHandle, -1, newPosition)
+end
+
+function moveToTarget(dronePosition, targetPosition)
+    -- Move the drone toward the target while maintaining altitude
+    local direction = {targetPosition[1] - dronePosition[1], targetPosition[2] - dronePosition[2]}
+    local distance = math.sqrt(direction[1]^2 + direction[2]^2)
+    
+    if distance > 0.1 then  -- Move only if the distance to the target is significant
+        local moveStep = 0.01  -- Step size
+        direction[1] = (direction[1] / distance) * moveStep
+        direction[2] = (direction[2] / distance) * moveStep
+
+        dronePosition[1] = dronePosition[1] + direction[1]
+        dronePosition[2] = dronePosition[2] + direction[2]
+
+        -- Maintain fixed height
+        dronePosition[3] = fixedHeight
+        sim.setObjectPosition(droneHandle, -1, dronePosition)
+    end
+end
